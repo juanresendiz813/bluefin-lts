@@ -1,0 +1,105 @@
+name: Package parity (review only)
+
+# Read-only review helper: dumps `rpm -qa` from published ublue-os LTS images and
+# their projectbluefin/bluefin-lts counterparts, diffs the package-name sets and
+# uploads the raw lists as artifacts. Runs only on this review branch; publishes
+# nothing; needs no secrets.
+
+on:
+  push:
+    branches:
+      - review/pkg-parity
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pkg-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: regular
+            old: ghcr.io/ublue-os/bluefin:lts
+            new: ghcr.io/projectbluefin/bluefin-lts:stable
+          - name: gdx-vs-nvidia
+            old: ghcr.io/ublue-os/bluefin-gdx:lts
+            new: ghcr.io/projectbluefin/bluefin-lts-nvidia:stable
+          - name: dx-vs-regular
+            old: ghcr.io/ublue-os/bluefin-dx:lts
+            new: ghcr.io/projectbluefin/bluefin-lts:stable
+          - name: hwe-vs-regular
+            old: ghcr.io/ublue-os/bluefin:lts-hwe
+            new: ghcr.io/projectbluefin/bluefin-lts:stable
+    steps:
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h / | tail -1
+          podman --version
+
+      - name: Dump package lists
+        env:
+          OLD_IMAGE: ${{ matrix.old }}
+          NEW_IMAGE: ${{ matrix.new }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          dump() {
+            side="$1"; img="$2"
+            podman pull --platform linux/amd64 "$img"
+            podman image inspect --format '{{.Digest}} kernel={{index .Labels "ostree.linux"}} created={{index .Labels "org.opencontainers.image.created"}} version={{index .Labels "org.opencontainers.image.version"}}' "$img" | tee "out/${side}.meta"
+            podman run --rm "$img" rpm -qa --qf '%{NAME}\n' | sort -u > "out/${side}.names"
+            podman run --rm "$img" rpm -qa --qf '%{NAME}\t%{EVR}\t%{ARCH}\n' | sort > "out/${side}.nevra"
+            podman run --rm "$img" bash -c 'for d in /etc/systemd/system/*.wants /usr/lib/systemd/system/*.wants /etc/systemd/user/*.wants /usr/lib/systemd/user/*.wants; do [ -d "$d" ] && for u in "$d"/*; do echo "$(basename "$d")/$(basename "$u")"; done; done | sort' > "out/${side}.wants" || true
+            podman run --rm "$img" bash -c 'cat /usr/share/ublue-os/image-info.json; echo; echo "--- just files ---"; ls -1 /usr/share/ublue-os/just/ 2>/dev/null; echo "--- ujust recipes ---"; just --justfile /usr/share/ublue-os/justfile --summary 2>/dev/null | tr " " "\n" | sort; echo "--- kernels ---"; ls -1 /usr/lib/modules/; echo "--- kargs.d ---"; cat /usr/lib/bootc/kargs.d/*.toml 2>/dev/null; echo "--- os-release ---"; cat /usr/lib/os-release' > "out/${side}.imageinfo" || true
+            podman rmi -f "$img" >/dev/null
+            df -h / | tail -1
+          }
+          dump old "$OLD_IMAGE"
+          dump new "$NEW_IMAGE"
+
+          comm -23 out/old.names out/new.names > out/only-in-old.txt
+          comm -13 out/old.names out/new.names > out/only-in-new.txt
+          comm -12 out/old.names out/new.names > out/common.txt
+
+          {
+            echo "## ${{ matrix.name }}"
+            echo
+            echo '```'
+            echo "old: $OLD_IMAGE"; cat out/old.meta
+            echo "new: $NEW_IMAGE"; cat out/new.meta
+            echo '```'
+            echo
+            echo "| set | count |"
+            echo "|---|---|"
+            echo "| packages in old | $(wc -l < out/old.names) |"
+            echo "| packages in new | $(wc -l < out/new.names) |"
+            echo "| common | $(wc -l < out/common.txt) |"
+            echo "| only in old (LOST on migration) | $(wc -l < out/only-in-old.txt) |"
+            echo "| only in new (GAINED) | $(wc -l < out/only-in-new.txt) |"
+            echo
+            echo "<details><summary>only in old (lost)</summary>"; echo; echo '```'; cat out/only-in-old.txt; echo '```'; echo "</details>"
+            echo
+            echo "<details><summary>only in new (gained)</summary>"; echo; echo '```'; cat out/only-in-new.txt; echo '```'; echo "</details>"
+            echo
+            echo "<details><summary>old image info</summary>"; echo; echo '```'; cat out/old.imageinfo; echo '```'; echo "</details>"
+            echo
+            echo "<details><summary>new image info</summary>"; echo; echo '```'; cat out/new.imageinfo; echo '```'; echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload lists
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pkg-parity-${{ matrix.name }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
