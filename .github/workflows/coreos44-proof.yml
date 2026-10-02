@@ -1,0 +1,195 @@
+name: CoreOS 44 akmods proof (fork only)
+
+# Fork-only proof build for the coreos-stable-44 akmods bump on this branch
+# (ublue-os/akmods#600 drops the Fedora 43 CoreOS akmods that HWE, DX-HWE and
+# GDX build from). Builds the three affected images the way
+# reusable-build-image.yml does for build-regular-hwe.yml, build-dx-hwe.yml and
+# build-gdx.yml off a non-lts branch (amd64 only), then reads the kernel, the
+# akmods/zfs/nvidia packages and modinfo inside each image, next to the
+# published control image. Nothing is pushed or signed. Not for upstream.
+
+on:
+  push:
+    branches:
+      - test/coreos44-proof
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CENTOS_VERSION: stream10
+
+jobs:
+  build:
+    name: ${{ matrix.image }} (${{ matrix.tag }}, amd64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # build-regular-hwe.yml: image bluefin, hwe true -> DEFAULT_TAG lts-hwe-testing, DX 0 GDX 0 HWE 1, GNOME 49
+          - image: bluefin
+            tag: lts-hwe-testing
+            dx: "0"
+            gdx: "0"
+            hwe: "1"
+            gnome: "49"
+            control: ghcr.io/ublue-os/bluefin:lts-hwe-testing
+          # build-dx-hwe.yml: image bluefin-dx, flavor dx, hwe true -> lts-hwe-testing, DX 1 GDX 0 HWE 1, GNOME 49
+          - image: bluefin-dx
+            tag: lts-hwe-testing
+            dx: "1"
+            gdx: "0"
+            hwe: "1"
+            gnome: "49"
+            control: ghcr.io/ublue-os/bluefin-dx:lts-hwe-testing
+          # build-gdx.yml: image bluefin-gdx, flavor gdx (matches both "gdx" and "dx"), gnome 50, no hwe -> lts-testing, DX 1 GDX 1 HWE 0
+          - image: bluefin-gdx
+            tag: lts-testing
+            dx: "1"
+            gdx: "1"
+            hwe: "0"
+            gnome: "50"
+            control: ghcr.io/ublue-os/bluefin-gdx:lts-testing
+    env:
+      IMAGE_NAME: ${{ matrix.image }}
+      DEFAULT_TAG: ${{ matrix.tag }}
+      CONTROL: ${{ matrix.control }}
+    steps:
+      - name: Maximize build space
+        uses: ublue-os/remove-unwanted-software@695eb75bc387dbcd9685a8e72d23439d8686cba6 # v10
+
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          submodules: recursive
+
+      - name: Setup Just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+
+      - name: Check Just Syntax
+        shell: bash
+        run: just check
+
+      - name: akmods tags requested by this build (registry read, before the build)
+        shell: bash
+        run: |
+          set -x
+          echo "coreos_stable_version in Justfile: $(grep -n 'coreos_stable_version' Justfile | head -1)"
+          echo "FEDORA_VERSION in kernel-swap.sh: $(grep -n 'FEDORA_VERSION=' build_scripts/scripts/kernel-swap.sh)"
+          for repo in akmods akmods-zfs akmods-nvidia-open; do
+            echo "== ghcr.io/ublue-os/${repo}:coreos-stable-44 (floating, what the Containerfile FROMs for zfs/nvidia-open) =="
+            skopeo inspect --override-arch amd64 "docker://ghcr.io/ublue-os/${repo}:coreos-stable-44" | jq -r '"digest=\(.Digest) ostree.linux=\(.Labels["ostree.linux"]) version=\(.Labels["org.opencontainers.image.version"]) created=\(.Created)"'
+            echo "== ${repo}: coreos-stable-44-7.* tags =="
+            skopeo list-tags "docker://ghcr.io/ublue-os/${repo}" | jq -r '.Tags[] | select(startswith("coreos-stable-44-7"))' | sort -V
+          done
+
+      # Same command as reusable-build-image.yml's "Build Image" step for the
+      # matching caller workflow on a non-production branch. No rechunk, no push.
+      - name: Build Image (${{ matrix.image }}:${{ matrix.tag }}, no push)
+        shell: bash
+        env:
+          DX: ${{ matrix.dx }}
+          GDX: ${{ matrix.gdx }}
+          HWE: ${{ matrix.hwe }}
+          GNOME: ${{ matrix.gnome }}
+        run: |
+          set -x
+          just=$(which just)
+          sudo $just build "${IMAGE_NAME}" "${DEFAULT_TAG}" "${DX}" "${GDX}" "${HWE}" "" "${GNOME}"
+
+      - name: Write the in-image inspection script
+        shell: bash
+        run: |
+          cat > /tmp/inspect.sh <<'EOF'
+          #!/bin/bash
+          # Runs inside the image. Prints everything; the assertions live in the workflow.
+          set -u
+          echo "### image-info.json"; cat /usr/share/ublue-os/image-info.json 2>&1; echo
+          echo "### rpm -q kernel kernel-core"; rpm -q kernel kernel-core
+          echo "### ls /usr/lib/modules"; ls /usr/lib/modules
+          KVER="$(rpm -q kernel --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}')"
+          echo "### kver=${KVER}"
+          echo "### common akmods + zfs rpms"; rpm -qa | grep -E 'xone|openrazer|framework|v4l2loopback|zfs' | sort
+          echo "### modinfo -k ${KVER} zfs"; modinfo -k "${KVER}" zfs 2>&1 | grep -E '^(filename|version|vermagic|srcversion):'
+          for m in xone-wired openrazer_driver framework_laptop v4l2loopback; do
+            echo "### modinfo -k ${KVER} ${m}"; modinfo -k "${KVER}" "${m}" 2>&1 | grep -E '^(filename|vermagic):' || true
+          done
+          if rpm -q kmod-nvidia >/dev/null 2>&1; then
+            echo "### rpm -q kmod-nvidia nvidia-driver nvidia-driver-cuda"; rpm -q kmod-nvidia nvidia-driver nvidia-driver-cuda
+            echo "### /etc/yum.repos.d/fedora-nvidia.repo"; grep -nE '^\[|baseurl|releasever' /etc/yum.repos.d/fedora-nvidia.repo
+            echo "### modinfo -k ${KVER} nvidia"; modinfo -k "${KVER}" nvidia 2>&1 | grep -E '^(filename|version|vermagic):'
+          else
+            echo "### (no kmod-nvidia in this image)"
+          fi
+          echo "### versionlock"; dnf versionlock list 2>/dev/null | grep -E 'kernel' || true
+          EOF
+          chmod +x /tmp/inspect.sh
+
+      - name: Inspect the built image
+        shell: bash
+        run: |
+          sudo podman image inspect "localhost/${IMAGE_NAME}:${DEFAULT_TAG}" --format 'built: {{index .Labels "org.opencontainers.image.version"}} ostree.linux={{index .Labels "ostree.linux"}} {{.Id}}'
+          sudo podman run --rm -v /tmp/inspect.sh:/inspect.sh:ro "localhost/${IMAGE_NAME}:${DEFAULT_TAG}" /inspect.sh | tee "/tmp/built-${IMAGE_NAME}.txt"
+
+      - name: Assert the built image is on the CoreOS 44 kernel with matching akmods
+        shell: bash
+        env:
+          GDX: ${{ matrix.gdx }}
+        run: |
+          set -euo pipefail
+          IMG="localhost/${IMAGE_NAME}:${DEFAULT_TAG}"
+          run() { sudo podman run --rm "${IMG}" "$@"; }
+          KVER="$(run rpm -q kernel --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}')"
+          echo "kver=${KVER}"
+          [[ "${KVER}" == *.fc44.* ]] || { echo "FAIL: kernel is not fc44"; exit 1; }
+          run rpm -q kernel-core | grep -F '.fc44.'
+          [[ "$(run ls /usr/lib/modules | wc -l)" -eq 1 ]] || { echo "FAIL: more than one /usr/lib/modules dir"; exit 1; }
+          [[ "$(run ls /usr/lib/modules)" == "${KVER}" ]] || { echo "FAIL: /usr/lib/modules dir != kver"; exit 1; }
+          run rpm -q "kmod-zfs-${KVER}" zfs
+          run modinfo -k "${KVER}" zfs | grep -E '^vermagic:' | grep -F "${KVER}"
+          if [[ "${GDX}" == "1" ]]; then
+            run rpm -q "kmod-nvidia-${KVER}" nvidia-driver
+            run modinfo -k "${KVER}" nvidia | grep -E '^vermagic:' | grep -F "${KVER}"
+            run grep -E 'fedora/44' /etc/yum.repos.d/fedora-nvidia.repo
+          fi
+          echo "PASS: ${IMAGE_NAME} on ${KVER}"
+
+      # Separate, non-fatal: upstream's own HWE build log (ublue-os/bluefin-lts run
+      # 36969943155, 2026-10-02) shows kernel-swap.sh's common-akmods dnf transaction
+      # failing on the fc43 akmods too ("Can not load RPM file: /run/common-akmods/rpms/*xone*.rpm",
+      # swallowed by the "non-critical" fallback), so an empty result here is
+      # pre-existing and not a property of the 43->44 bump. Compare with the control.
+      - name: Check the common akmods (xone/openrazer/framework/v4l2loopback) on the built image (non-fatal)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="localhost/${IMAGE_NAME}:${DEFAULT_TAG}"
+          KVER="$(sudo podman run --rm "${IMG}" rpm -q kernel --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}')"
+          sudo podman run --rm "${IMG}" rpm -qa | grep -E 'kmod-(xone|openrazer|framework-laptop|v4l2loopback)' | grep -F -- "-${KVER}-" || { echo "WARN: no common akmods kmods for ${KVER} in the built image"; exit 1; }
+          echo "common akmods present for ${KVER}"
+
+      - name: Control, published ${{ matrix.control }} (expected fc43 until the fix ships)
+        if: always()
+        shell: bash
+        run: |
+          sudo podman pull -q "${CONTROL}"
+          sudo podman image inspect "${CONTROL}" --format 'control: {{index .Labels "org.opencontainers.image.version"}} ostree.linux={{index .Labels "ostree.linux"}} {{.Digest}}'
+          sudo podman run --rm -v /tmp/inspect.sh:/inspect.sh:ro "${CONTROL}" /inspect.sh | tee "/tmp/control-${IMAGE_NAME}.txt"
+
+      - name: Upload inspection output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: coreos44-proof-${{ matrix.image }}
+          if-no-files-found: ignore
+          path: |
+            /tmp/built-*.txt
+            /tmp/control-*.txt
